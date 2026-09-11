@@ -1,6 +1,7 @@
 package mpegts
 
 import (
+	"context"
 	"io"
 
 	"github.com/AlexxIT/go2rtc/pkg/aac"
@@ -114,6 +115,15 @@ func (c *Consumer) WriteTo(wr io.Writer) (int64, error) {
 	}
 
 	return c.wr.WriteTo(wr)
+}
+
+func (c *Consumer) WriteToContext(ctx context.Context, wr io.Writer) (int64, error) {
+	b := c.muxer.GetHeader()
+	if _, err := wr.Write(b); err != nil {
+		return 0, err
+	}
+
+	return c.wr.WriteToContext(ctx, wr)
 }
 
 //func TimestampFromRTP(rtp *rtp.Packet, codec *core.Codec) {

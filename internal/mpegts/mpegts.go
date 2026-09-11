@@ -36,12 +36,11 @@ func outputMpegTS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	defer stream.RemoveConsumer(cons)
 
 	w.Header().Add("Content-Type", "video/mp2t")
 
-	_, _ = cons.WriteTo(w)
-
-	stream.RemoveConsumer(cons)
+	_, _ = cons.WriteToContext(r.Context(), w)
 }
 
 func inputMpegTS(w http.ResponseWriter, r *http.Request) {

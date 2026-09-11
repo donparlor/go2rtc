@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"sync"
@@ -44,6 +45,36 @@ func (w *WriteBuffer) WriteTo(wr io.Writer) (n int64, err error) {
 	w.Reset(wr)
 	w.wg.Wait()
 	return 0, w.err // TODO: fix counter
+}
+
+func (w *WriteBuffer) WriteToContext(ctx context.Context, wr io.Writer) (n int64, err error) {
+	w.Reset(wr)
+
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+			w.cancel(ctx.Err())
+		case <-stop:
+		}
+	}()
+
+	w.wg.Wait()
+	close(stop)
+	<-stopped
+
+	return 0, w.err // TODO: fix counter
+}
+
+func (w *WriteBuffer) cancel(err error) {
+	w.mu.Lock()
+	if w.err == nil {
+		w.err = err
+	}
+	w.done()
+	w.mu.Unlock()
 }
 
 func (w *WriteBuffer) Close() error {
