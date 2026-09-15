@@ -83,7 +83,13 @@ func (c *WebRTCClient) AddTrack(media *core.Media, codec *core.Codec, track *cor
 }
 
 func (c *WebRTCClient) Start() error {
-	c.api.StartExtendStreamTimer()
+	c.api.StartExtendStreamTimer(func(error) {
+		// Close() signals c.closed before closing the PeerConnection,
+		// which guarantees that Conn.Start() wakes up and the existing
+		// producer reconnect path can create a fresh Nest session.
+		_ = c.conn.Close()
+	})
+
 	return c.conn.Start()
 }
 
@@ -182,13 +188,21 @@ func (c *RTSPClient) GetTrack(media *core.Media, codec *core.Codec) (*core.Recei
 }
 
 func (c *RTSPClient) Start() error {
-	c.api.StartExtendStreamTimer()
+	c.api.StartExtendStreamTimer(func(error) {
+		// Stop() moves the RTSP connection to StateNone and closes
+		// the transport so Conn.Start() returns to the reconnect path.
+		_ = c.conn.Stop()
+	})
+
 	return c.conn.Start()
 }
 
 func (c *RTSPClient) Stop() error {
-	c.api.StopRTSPStream()
+	// Stop the extension worker first so StopRTSPStream cannot race
+	// an in-flight extension that mutates the same Nest session state.
 	c.api.StopExtendStreamTimer()
+	c.api.StopRTSPStream()
+
 	return c.conn.Stop()
 }
 

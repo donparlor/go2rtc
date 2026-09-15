@@ -2,14 +2,50 @@ package nest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 )
+
+const (
+	nestHTTPTimeout     = 15 * time.Second
+	nestExtendLead      = 90 * time.Second
+	nestExtendMinDelay  = 30 * time.Second
+	nestExtendMinMargin = 20 * time.Second
+)
+
+func nextExtendDelay(now, expiresAt time.Time) (time.Duration, error) {
+	remaining := expiresAt.Sub(now)
+	if remaining <= 0 {
+		return 0, errors.New("nest: stream session expired")
+	}
+
+	delay := remaining - nestExtendLead
+	if delay < nestExtendMinDelay {
+		delay = nestExtendMinDelay
+	}
+
+	if remaining-delay < nestExtendMinMargin {
+		return 0, errors.New("nest: stream session too close to expiry")
+	}
+
+	return delay, nil
+}
+
+type httpDoer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+type oauthToken struct {
+	Token     string
+	ExpiresAt time.Time
+}
 
 type API struct {
 	Token     string
@@ -26,10 +62,15 @@ type API struct {
 	StreamToken          string
 	StreamExtensionToken string
 
-	key string // credentials cache key, used to refresh the OAuth token
+	key               string // credentials cache key, used to refresh the OAuth token
+	clientID          string
+	clientSecret      string
+	oauthRefreshToken string
+	client            httpDoer
 
-	extendTimer *time.Timer
-	extendStop  chan struct{}
+	extendMu     sync.Mutex
+	extendCancel context.CancelFunc
+	extendDone   chan struct{}
 }
 
 type Auth struct {
@@ -45,21 +86,12 @@ type DeviceInfo struct {
 var cache = map[string]*API{}
 var cacheMu sync.Mutex
 
-func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-
-	key := clientID + ":" + clientSecret + ":" + refreshToken
-	now := time.Now()
-
-	// The cache only stores the OAuth token. Each caller gets its own API
-	// instance, because the Stream* fields hold per-stream session state -
-	// multiple cameras sharing one instance overwrite each other's session
-	// and only the last one gets extended.
-	if api := cache[key]; api != nil && now.Before(api.ExpiresAt) {
-		return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
-	}
-
+func requestOAuthToken(
+	ctx context.Context,
+	client httpDoer,
+	clientID, clientSecret, refreshToken string,
+	now time.Time,
+) (oauthToken, error) {
 	data := url.Values{
 		"grant_type":    []string{"refresh_token"},
 		"client_id":     []string{clientID},
@@ -67,15 +99,29 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 		"refresh_token": []string{refreshToken},
 	}
 
-	client := &http.Client{Timeout: time.Second * 5000}
-	res, err := client.PostForm("https://www.googleapis.com/oauth2/v4/token", data)
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		"https://www.googleapis.com/oauth2/v4/token",
+		strings.NewReader(data.Encode()),
+	)
 	if err != nil {
-		return nil, err
+		return oauthToken{}, err
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	res, err := client.Do(req)
+	if err != nil {
+		return oauthToken{}, err
 	}
 	defer res.Body.Close()
 
-	if res.StatusCode != 200 {
-		return nil, errors.New("nest: wrong status: " + res.Status)
+	if res.StatusCode != http.StatusOK {
+		return oauthToken{}, &httpStatusError{
+			StatusCode: res.StatusCode,
+			Status:     res.Status,
+		}
 	}
 
 	var resv struct {
@@ -86,17 +132,66 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 	}
 
 	if err = json.NewDecoder(res.Body).Decode(&resv); err != nil {
+		return oauthToken{}, err
+	}
+
+	return oauthToken{
+		Token:     resv.AccessToken,
+		ExpiresAt: now.Add(resv.ExpiresIn * time.Second),
+	}, nil
+}
+
+func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
+	key := clientID + ":" + clientSecret + ":" + refreshToken
+	now := time.Now()
+	client := &http.Client{Timeout: nestHTTPTimeout}
+
+	cacheMu.Lock()
+	if cached := cache[key]; cached != nil && now.Before(cached.ExpiresAt) {
+		token := cached.Token
+		expiresAt := cached.ExpiresAt
+		cacheMu.Unlock()
+
+		return &API{
+			Token:             token,
+			ExpiresAt:         expiresAt,
+			key:               key,
+			clientID:          clientID,
+			clientSecret:      clientSecret,
+			oauthRefreshToken: refreshToken,
+			client:            client,
+		}, nil
+	}
+	cacheMu.Unlock()
+
+	token, err := requestOAuthToken(
+		context.Background(),
+		client,
+		clientID,
+		clientSecret,
+		refreshToken,
+		now,
+	)
+	if err != nil {
 		return nil, err
 	}
 
-	api := &API{
-		Token:     resv.AccessToken,
-		ExpiresAt: now.Add(resv.ExpiresIn * time.Second),
+	cacheMu.Lock()
+	cache[key] = &API{
+		Token:     token.Token,
+		ExpiresAt: token.ExpiresAt,
 	}
+	cacheMu.Unlock()
 
-	cache[key] = api
-
-	return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
+	return &API{
+		Token:             token.Token,
+		ExpiresAt:         token.ExpiresAt,
+		key:               key,
+		clientID:          clientID,
+		clientSecret:      clientSecret,
+		oauthRefreshToken: refreshToken,
+		client:            client,
+	}, nil
 }
 
 func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
@@ -108,7 +203,7 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: nestHTTPTimeout}
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -185,7 +280,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 
 		req.Header.Set("Authorization", "Bearer "+a.Token)
 
-		client := &http.Client{Timeout: time.Second * 5000}
+		client := &http.Client{Timeout: nestHTTPTimeout}
 		res, err := client.Do(req)
 		if err != nil {
 			return "", err
@@ -235,30 +330,173 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 }
 
 func (a *API) refreshToken() error {
-	if a.key == "" {
-		return errors.New("nest: unable to find cached credentials")
+	return a.refreshTokenWithContext(context.Background())
+}
+
+func (a *API) refreshTokenWithContext(ctx context.Context) error {
+	if a.key == "" ||
+		a.clientID == "" ||
+		a.clientSecret == "" ||
+		a.oauthRefreshToken == "" {
+		return errors.New("nest: missing OAuth credentials")
 	}
 
-	// Parse credentials from the cache key
-	parts := strings.SplitN(a.key, ":", 3)
-	if len(parts) != 3 {
-		return errors.New("nest: invalid cache key format")
+	client := a.client
+	if client == nil {
+		client = &http.Client{Timeout: nestHTTPTimeout}
 	}
-	clientID, clientSecret, refreshToken := parts[0], parts[1], parts[2]
 
-	// Get new API instance which will refresh the token
-	newAPI, err := NewAPI(clientID, clientSecret, refreshToken)
+	token, err := requestOAuthToken(
+		ctx,
+		client,
+		a.clientID,
+		a.clientSecret,
+		a.oauthRefreshToken,
+		time.Now(),
+	)
 	if err != nil {
 		return err
 	}
 
-	// Update current API with new token
-	a.Token = newAPI.Token
-	a.ExpiresAt = newAPI.ExpiresAt
+	// Publish only after the OAuth request has fully succeeded.
+	a.Token = token.Token
+	a.ExpiresAt = token.ExpiresAt
+
+	cacheMu.Lock()
+	cache[a.key] = &API{
+		Token:     token.Token,
+		ExpiresAt: token.ExpiresAt,
+	}
+	cacheMu.Unlock()
+
 	return nil
 }
 
+type httpStatusError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *httpStatusError) Error() string {
+	return "nest: wrong status: " + e.Status
+}
+
+func isRetryableNestError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		switch statusErr.StatusCode {
+		case http.StatusRequestTimeout,
+			http.StatusConflict,
+			http.StatusTooManyRequests:
+			return true
+		}
+
+		return statusErr.StatusCode >= 500
+	}
+
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+func waitContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func nestRetryDelay(attempt int) time.Duration {
+	if attempt == 0 {
+		return 2 * time.Second
+	}
+
+	return 5 * time.Second
+}
+
+func retryNestOperation(
+	ctx context.Context,
+	operation func(context.Context) error,
+	wait func(context.Context, time.Duration) error,
+) error {
+	var lastErr error
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		err := operation(ctx)
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		if !isRetryableNestError(err) || attempt == 2 {
+			return err
+		}
+
+		if err = wait(ctx, nestRetryDelay(attempt)); err != nil {
+			return err
+		}
+	}
+
+	return lastErr
+}
+
+func (a *API) extendStreamWithAuth(ctx context.Context) error {
+	// Long-lived sessions may outlive the OAuth token.
+	if time.Now().After(a.ExpiresAt.Add(-30 * time.Second)) {
+		if err := a.refreshTokenWithContext(ctx); err != nil {
+			return err
+		}
+	}
+
+	err := a.extendStreamWithContext(ctx)
+	if err == nil {
+		return nil
+	}
+
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) ||
+		statusErr.StatusCode != http.StatusUnauthorized {
+		return err
+	}
+
+	// A 401 must force a real OAuth refresh outside the cache.
+	if err = a.refreshTokenWithContext(ctx); err != nil {
+		return err
+	}
+
+	return a.extendStreamWithContext(ctx)
+}
+
+func (a *API) extendStreamWithRetry(ctx context.Context) error {
+	return retryNestOperation(
+		ctx,
+		a.extendStreamWithAuth,
+		waitContext,
+	)
+}
+
 func (a *API) ExtendStream() error {
+	return a.extendStreamWithContext(context.Background())
+}
+
+func (a *API) extendStreamWithContext(ctx context.Context) error {
 	var reqv struct {
 		Command string `json:"command"`
 		Params  struct {
@@ -284,22 +522,30 @@ func (a *API) ExtendStream() error {
 
 	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
 		a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
-	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uri, bytes.NewReader(b))
 	if err != nil {
 		return err
 	}
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := a.client
+	if client == nil {
+		client = &http.Client{Timeout: nestHTTPTimeout}
+	}
+
 	res, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
 
-	if res.StatusCode != 200 {
-		return errors.New("nest: wrong status: " + res.Status)
+	if res.StatusCode != http.StatusOK {
+		return &httpStatusError{
+			StatusCode: res.StatusCode,
+			Status:     res.Status,
+		}
 	}
 
 	var resv struct {
@@ -344,7 +590,7 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: nestHTTPTimeout}
 	res, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -408,7 +654,7 @@ func (a *API) StopRTSPStream() error {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	client := &http.Client{Timeout: nestHTTPTimeout}
 	res, err := client.Do(req)
 	if err != nil {
 		return err
@@ -460,46 +706,133 @@ type Device struct {
 	} `json:"parentRelations"`
 }
 
-func (a *API) StartExtendStreamTimer() {
-	if a.extendTimer != nil {
+func (a *API) StartExtendStreamTimer(onFatal func(error)) {
+	a.extendMu.Lock()
+
+	// extendDone stays non-nil until the current runner has completely
+	// exited, including any fatal callback.
+	if a.extendDone != nil {
+		a.extendMu.Unlock()
 		return
 	}
 
-	// Google expires sessions after ~5 minutes; each successful extension
-	// returns a new expiresAt, so keep extending until the stream stops.
-	timer := time.NewTimer(time.Until(a.StreamExpiresAt) - time.Minute)
-	stop := make(chan struct{})
-	a.extendTimer = timer
-	a.extendStop = stop
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 
-	go func() {
-		for {
-			select {
-			case <-timer.C:
-				// The OAuth token lives ~1 hour, sessions can live longer
-				if time.Now().After(a.ExpiresAt.Add(-30 * time.Second)) {
-					if err := a.refreshToken(); err != nil {
-						return
-					}
-				}
-				if err := a.ExtendStream(); err != nil {
-					return
-				}
-				timer.Reset(time.Until(a.StreamExpiresAt) - time.Minute)
-			case <-stop:
-				return
-			}
+	a.extendCancel = cancel
+	a.extendDone = done
+
+	a.extendMu.Unlock()
+
+	go a.runExtendStreamTimer(ctx, done, onFatal)
+}
+
+func (a *API) callExtendFatal(
+	ctx context.Context,
+	done chan struct{},
+	onFatal func(error),
+	err error,
+) {
+	if onFatal == nil {
+		return
+	}
+
+	a.extendMu.Lock()
+
+	// StopExtendStreamTimer cancels the context while holding this same
+	// mutex. Whichever path acquires the mutex first determines whether
+	// this is a normal stop or a fatal runner termination.
+	if a.extendDone != done ||
+		a.extendCancel == nil ||
+		ctx.Err() != nil {
+		a.extendMu.Unlock()
+		return
+	}
+
+	// Fatal termination is now committed. Keep extendDone non-nil so a
+	// second runner cannot start before this one has completely exited.
+	a.extendCancel = nil
+
+	a.extendMu.Unlock()
+
+	onFatal(err)
+}
+
+func (a *API) runExtendStreamTimer(
+	ctx context.Context,
+	done chan struct{},
+	onFatal func(error),
+) {
+	defer func() {
+		a.extendMu.Lock()
+
+		if a.extendDone == done {
+			a.extendCancel = nil
+			a.extendDone = nil
 		}
+
+		a.extendMu.Unlock()
+		close(done)
 	}()
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		delay, err := nextExtendDelay(
+			time.Now(),
+			a.StreamExpiresAt,
+		)
+		if err != nil {
+			a.callExtendFatal(ctx, done, onFatal, err)
+			return
+		}
+
+		timer := time.NewTimer(delay)
+
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
+
+		err = a.extendStreamWithRetry(ctx)
+		if err == nil {
+			continue
+		}
+
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+
+		a.callExtendFatal(ctx, done, onFatal, err)
+		return
+	}
 }
 
 func (a *API) StopExtendStreamTimer() {
-	if a.extendTimer != nil {
-		a.extendTimer.Stop()
-		a.extendTimer = nil
+	a.extendMu.Lock()
+
+	cancel := a.extendCancel
+	done := a.extendDone
+
+	// Publish normal cancellation while holding the same mutex used by
+	// callExtendFatal. This closes the Stop-vs-fatal decision window.
+	if cancel != nil {
+		cancel()
 	}
-	if a.extendStop != nil {
-		close(a.extendStop)
-		a.extendStop = nil
+
+	a.extendMu.Unlock()
+
+	// Never wait for the runner while holding extendMu.
+	if done != nil {
+		<-done
 	}
 }
