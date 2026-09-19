@@ -35,7 +35,13 @@ func (w *Waiter) Wait() error {
 
 	w.WaitGroup.Wait()
 
-	return w.err
+	// Done writes err while holding mu, after releasing the WaitGroup.
+	// Wait must acquire the same lock before reading the result.
+	w.mu.Lock()
+	err := w.err
+	w.mu.Unlock()
+
+	return err
 }
 
 func (w *Waiter) Done(err error) {
