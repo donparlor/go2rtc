@@ -3,7 +3,10 @@ package webrtc
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -11,6 +14,8 @@ import (
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
+
+const nestH264Timeout = 30 * time.Second
 
 type Conn struct {
 	core.Connection
@@ -22,6 +27,18 @@ type Conn struct {
 
 	offer  string
 	closed core.Waiter
+
+	// Independent of core.Waiter: the watchdog must not hold Start() open.
+	done     chan struct{}
+	doneOnce sync.Once
+
+	// time.Since(nestEpoch) preserves Go's monotonic clock.
+	nestEpoch           time.Time
+	nestWatchOnce       sync.Once
+	nestFailOnce        sync.Once
+	nestVideoSeen       atomic.Bool
+	nestLastVideoNS     atomic.Int64
+	nestUnmarshalErrors atomic.Uint64
 }
 
 func NewConn(pc *webrtc.PeerConnection) *Conn {
@@ -31,7 +48,9 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			FormatName: "webrtc",
 			Transport:  pc,
 		},
-		pc: pc,
+		pc:        pc,
+		done:      make(chan struct{}),
+		nestEpoch: time.Now(),
 	}
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
@@ -79,6 +98,11 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			return
 		}
 
+		nestH264 := c.FormatName == "nest/webrtc" &&
+			c.Mode == core.ModeActiveProducer &&
+			remote.Kind() == webrtc.RTPCodecTypeVideo &&
+			codec.Name == core.CodecH264
+
 		switch c.Mode {
 		case core.ModePassiveProducer, core.ModeActiveProducer:
 			// replace the theoretical list of codecs with the actual list of codecs
@@ -102,6 +126,9 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			b := make([]byte, ReceiveMTU)
 			n, _, err := remote.Read(b)
 			if err != nil {
+				if nestH264 && !c.isDone() {
+					c.failNestH264("read_error", err)
+				}
 				return
 			}
 
@@ -109,11 +136,20 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 
 			packet := &rtp.Packet{}
 			if err := packet.Unmarshal(b[:n]); err != nil {
+				if nestH264 {
+					c.nestUnmarshalErrors.Add(1)
+					continue
+				}
 				return
 			}
 
 			if len(packet.Payload) == 0 {
 				continue
+			}
+
+			if nestH264 {
+				c.nestLastVideoNS.Store(int64(time.Since(c.nestEpoch)))
+				c.nestVideoSeen.Store(true)
 			}
 
 			track.WriteRTP(packet)
@@ -134,6 +170,12 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 
 		switch state {
 		case webrtc.PeerConnectionStateConnected:
+			// Nest requests an H264 video media in its WebRTC session.
+			if c.FormatName == "nest/webrtc" &&
+				c.Mode == core.ModeActiveProducer {
+				c.startNestH264Watchdog()
+			}
+
 			for _, sender := range c.Senders {
 				sender.Start()
 			}
@@ -152,8 +194,98 @@ func (c *Conn) MarshalJSON() ([]byte, error) {
 }
 
 func (c *Conn) Close() error {
+	c.doneOnce.Do(func() {
+		close(c.done)
+	})
+
 	c.closed.Done(nil)
 	return c.pc.Close()
+}
+
+func (c *Conn) isDone() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Conn) startNestH264Watchdog() {
+	// The initial deadline begins at Connected, not at NewConn.
+	c.startNestH264WatchdogAt(time.Since(c.nestEpoch))
+}
+
+// startNestH264WatchdogAt also lets tests simulate the initial deadline
+// without sleeping for 30 seconds.
+func (c *Conn) startNestH264WatchdogAt(started time.Duration) {
+	c.nestWatchOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-c.done:
+					return
+
+				case <-ticker.C:
+					now := time.Since(c.nestEpoch)
+
+					if reason := c.nestH264TimeoutReason(started, now); reason != "" {
+						c.failNestH264(reason, nil)
+						return
+					}
+				}
+			}
+		}()
+	})
+}
+
+// nestH264TimeoutReason evaluates the Nest video deadline.
+// started and now are monotonic elapsed durations from nestEpoch.
+func (c *Conn) nestH264TimeoutReason(started, now time.Duration) string {
+	if !c.nestVideoSeen.Load() {
+		if now-started >= nestH264Timeout {
+			return "no_video_initial"
+		}
+		return ""
+	}
+
+	last := time.Duration(c.nestLastVideoNS.Load())
+	if now-last >= nestH264Timeout {
+		return "stalled"
+	}
+
+	return ""
+}
+
+func (c *Conn) failNestH264(reason string, readErr error) {
+	c.nestFailOnce.Do(func() {
+		if c.isDone() {
+			return
+		}
+
+		var videoAge time.Duration
+
+		if c.nestVideoSeen.Load() {
+			videoAge = time.Since(c.nestEpoch) -
+				time.Duration(c.nestLastVideoNS.Load())
+		}
+
+		// Do not log c.URL, raw Nest errors, tokens or device IDs.
+		log.Printf(
+			"[nest/h264] recovery conn=%v reason=%s video_age=%s rtp_unmarshal_errors=%d read_error_type=%T",
+			c.ID,
+			reason,
+			videoAge.Round(time.Millisecond),
+			c.nestUnmarshalErrors.Load(),
+			readErr,
+		)
+
+		// The existing WebRTC Start()/Producer.reconnect() owns redial.
+		_ = c.Close()
+	})
 }
 
 func (c *Conn) AddCandidate(candidate string) error {
