@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/AlexxIT/go2rtc/pkg/h264"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -33,12 +34,22 @@ type Conn struct {
 	doneOnce sync.Once
 
 	// time.Since(nestEpoch) preserves Go's monotonic clock.
-	nestEpoch           time.Time
-	nestWatchOnce       sync.Once
-	nestFailOnce        sync.Once
-	nestVideoSeen       atomic.Bool
-	nestLastVideoNS     atomic.Int64
-	nestUnmarshalErrors atomic.Uint64
+	nestEpoch            time.Time
+	nestWatchOnce        sync.Once
+	nestFailOnce         sync.Once
+	nestVideoSeen        atomic.Bool
+	nestFirstVideoNS     atomic.Int64
+	nestLastVideoNS      atomic.Int64
+	nestLastValidH264NS  atomic.Int64
+	nestLastIDRNS        atomic.Int64
+	nestLastSPSNS        atomic.Int64
+	nestLastPPSNS        atomic.Int64
+	nestVideoRTPPackets  atomic.Uint64
+	nestValidH264Packets atomic.Uint64
+	nestIDRCount         atomic.Uint64
+	nestSPSCount         atomic.Uint64
+	nestPPSCount         atomic.Uint64
+	nestUnmarshalErrors  atomic.Uint64
 }
 
 func NewConn(pc *webrtc.PeerConnection) *Conn {
@@ -52,6 +63,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		done:      make(chan struct{}),
 		nestEpoch: time.Now(),
 	}
+	c.nestFirstVideoNS.Store(-1)
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		// last candidate will be empty
@@ -148,8 +160,10 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 
 			if nestH264 {
-				c.nestLastVideoNS.Store(int64(time.Since(c.nestEpoch)))
+				now := time.Since(c.nestEpoch)
+				c.nestLastVideoNS.Store(int64(now))
 				c.nestVideoSeen.Store(true)
+				c.observeNestH264RTP(packet.Payload, now)
 			}
 
 			track.WriteRTP(packet)
@@ -211,6 +225,136 @@ func (c *Conn) isDone() bool {
 	}
 }
 
+type nestH264DiagnosticState struct {
+	idrCount uint64
+	level    uint8
+}
+
+func (c *Conn) observeNestH264RTP(payload []byte, now time.Duration) {
+	c.nestFirstVideoNS.CompareAndSwap(-1, int64(now))
+	c.nestVideoRTPPackets.Add(1)
+
+	info := h264.InspectRTPPayload(payload)
+	if !info.Valid {
+		return
+	}
+
+	c.nestLastValidH264NS.Store(int64(now))
+	c.nestValidH264Packets.Add(1)
+
+	if info.IDR != 0 {
+		c.nestLastIDRNS.Store(int64(now))
+		c.nestIDRCount.Add(uint64(info.IDR))
+	}
+	if info.SPS != 0 {
+		c.nestLastSPSNS.Store(int64(now))
+		c.nestSPSCount.Add(uint64(info.SPS))
+	}
+	if info.PPS != 0 {
+		c.nestLastPPSNS.Store(int64(now))
+		c.nestPPSCount.Add(uint64(info.PPS))
+	}
+}
+
+func (c *Conn) nextNestH264IDRDiagnostic(
+	now time.Duration,
+	state *nestH264DiagnosticState,
+) (time.Duration, bool) {
+	if c.nestVideoRTPPackets.Load() == 0 {
+		// no_video_initial already explains this condition
+		return 0, false
+	}
+
+	lastVideo := time.Duration(c.nestLastVideoNS.Load())
+	if now-lastVideo >= nestH264Timeout {
+		// stalled already explains this condition
+		return 0, false
+	}
+
+	idrCount := c.nestIDRCount.Load()
+	if idrCount != state.idrCount {
+		state.idrCount = idrCount
+		state.level = 0
+	}
+
+	var base time.Duration
+	if idrCount == 0 {
+		base = time.Duration(c.nestFirstVideoNS.Load())
+	} else {
+		base = time.Duration(c.nestLastIDRNS.Load())
+	}
+
+	age := now - base
+	var level uint8
+
+	switch {
+	case age >= 120*time.Second:
+		level = 4
+	case age >= 90*time.Second:
+		level = 3
+	case age >= 60*time.Second:
+		level = 2
+	case age >= 30*time.Second:
+		level = 1
+	default:
+		return 0, false
+	}
+
+	if level <= state.level {
+		return 0, false
+	}
+
+	state.level = level
+	return time.Duration(level) * 30 * time.Second, true
+}
+
+func (c *Conn) logNestH264IDRDiagnostic(now, threshold time.Duration) {
+	idrCount := c.nestIDRCount.Load()
+
+	log.Printf(
+		"[nest/h264] diagnostic conn=%v reason=no_recent_idr threshold=%s video_age=%s valid_h264_age=%s idr_age=%s idr_wait=%s sps_rtp_age=%s pps_rtp_age=%s video_rtp_packets=%d valid_h264_packets=%d idr_count=%d sps_count=%d pps_count=%d rtp_unmarshal_errors=%d idr_seen=%t sps_rtp_seen=%t pps_rtp_seen=%t",
+		c.ID,
+		threshold,
+		nestH264ObservedAge(now, c.nestLastVideoNS.Load(), c.nestVideoRTPPackets.Load()),
+		nestH264ObservedAge(now, c.nestLastValidH264NS.Load(), c.nestValidH264Packets.Load()),
+		nestH264ObservedAge(now, c.nestLastIDRNS.Load(), idrCount),
+		nestH264IDRWait(now, c.nestFirstVideoNS.Load(), c.nestLastIDRNS.Load(), idrCount),
+		nestH264ObservedAge(now, c.nestLastSPSNS.Load(), c.nestSPSCount.Load()),
+		nestH264ObservedAge(now, c.nestLastPPSNS.Load(), c.nestPPSCount.Load()),
+		c.nestVideoRTPPackets.Load(),
+		c.nestValidH264Packets.Load(),
+		idrCount,
+		c.nestSPSCount.Load(),
+		c.nestPPSCount.Load(),
+		c.nestUnmarshalErrors.Load(),
+		idrCount != 0,
+		c.nestSPSCount.Load() != 0,
+		c.nestPPSCount.Load() != 0,
+	)
+}
+
+func nestH264ObservedAge(now time.Duration, last int64, count uint64) string {
+	if count == 0 {
+		return "none"
+	}
+	return nestH264ElapsedAge(now, time.Duration(last)).String()
+}
+
+func nestH264IDRWait(now time.Duration, firstVideo, lastIDR int64, idrCount uint64) string {
+	if idrCount == 0 {
+		return nestH264ElapsedAge(now, time.Duration(firstVideo)).String()
+	}
+	return nestH264ElapsedAge(now, time.Duration(lastIDR)).String()
+}
+
+func nestH264ElapsedAge(now, last time.Duration) time.Duration {
+	age := now - last
+	if age < 0 {
+		return 0
+	}
+	return age.Round(time.Millisecond)
+}
+
 func (c *Conn) startNestH264Watchdog() {
 	// The initial deadline begins at Connected, not at NewConn.
 	c.startNestH264WatchdogAt(time.Since(c.nestEpoch))
@@ -220,6 +364,8 @@ func (c *Conn) startNestH264Watchdog() {
 // without sleeping for 30 seconds.
 func (c *Conn) startNestH264WatchdogAt(started time.Duration) {
 	c.nestWatchOnce.Do(func() {
+		var diagnosticState nestH264DiagnosticState
+
 		go func() {
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
@@ -231,6 +377,10 @@ func (c *Conn) startNestH264WatchdogAt(started time.Duration) {
 
 				case <-ticker.C:
 					now := time.Since(c.nestEpoch)
+
+					if threshold, ok := c.nextNestH264IDRDiagnostic(now, &diagnosticState); ok {
+						c.logNestH264IDRDiagnostic(now, threshold)
+					}
 
 					if reason := c.nestH264TimeoutReason(started, now); reason != "" {
 						c.failNestH264(reason, nil)
