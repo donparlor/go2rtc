@@ -138,7 +138,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			b := make([]byte, ReceiveMTU)
 			n, _, err := remote.Read(b)
 			if err != nil {
-				if nestH264 && !c.isDone() {
+				if nestH264 && !c.isDone() && c.pc.SignalingState() != webrtc.SignalingStateClosed {
 					c.failNestH264("read_error", err)
 				}
 				return
@@ -412,7 +412,7 @@ func (c *Conn) nestH264TimeoutReason(started, now time.Duration) string {
 
 func (c *Conn) failNestH264(reason string, readErr error) {
 	c.nestFailOnce.Do(func() {
-		if c.isDone() {
+		if c.isDone() || c.pc.SignalingState() == webrtc.SignalingStateClosed {
 			return
 		}
 
